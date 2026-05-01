@@ -1,0 +1,37 @@
+# Build outputs
+build/
+cmake-build-*/
+compile_commands.json
+
+# Python/local tooling
+.cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated correctness/performance fixtures
+tests/fixtures/*.json
+tests/fixtures/gpt2/
+
+# Local environment and editor state
+.env*
+.DS_Store
+.claude/
+.vscode/
+
+# Local research/evolution workspaces and vendored comparison repos.
+# These are useful for private experimentation, but too noisy for the
+# tokenizer library's public source tree.
+refs/
+runs/
+scripts/__pycache__/
+scripts/openevolve_config.yaml
+scripts/prompts/
+scripts/ablate.py
+scripts/bench_baselines.py
+scripts/evaluator.py
+scripts/novelty_judge.py
+scripts/research_*.py
+scripts/run_loop.py
+scripts/trace_summarizer.py
+scripts/vendor_sota.py
