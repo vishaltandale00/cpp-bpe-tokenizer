@@ -62,6 +62,50 @@ enum class EncodeMode {
     ByteSpanRanks,
 };
 
+std::vector<uint32_t> encode_pair_rules_for_cache(
+    std::string_view piece,
+    const std::array<uint32_t, 256>& byte_lookup,
+    const std::array<MergeStep, 65536>& base_pair_lookup,
+    const std::unordered_map<TokenPair, MergeStep, TokenPairHash>& merge_lookup)
+{
+    std::vector<uint32_t> ids;
+    ids.reserve(piece.size());
+    for (unsigned char byte : piece) {
+        ids.push_back(byte_lookup[byte]);
+    }
+    if (ids.size() < 2 || merge_lookup.empty()) {
+        return ids;
+    }
+
+    auto get_pair_merge = [&](uint32_t left, uint32_t right) -> MergeStep {
+        if (left < 256 && right < 256) {
+            return base_pair_lookup[(left << 8) | right];
+        }
+        auto it = merge_lookup.find(TokenPair{left, right});
+        return it != merge_lookup.end() ? it->second : MergeStep{};
+    };
+
+    while (ids.size() > 1) {
+        uint32_t best_rank = UINT32_MAX;
+        size_t best_pos = ids.size();
+        uint32_t best_merged = UINT32_MAX;
+        for (size_t i = 0; i + 1 < ids.size(); ++i) {
+            const MergeStep merge = get_pair_merge(ids[i], ids[i + 1]);
+            if (merge.rank < best_rank) {
+                best_rank = merge.rank;
+                best_pos = i;
+                best_merged = merge.merged;
+            }
+        }
+        if (best_rank == UINT32_MAX) {
+            break;
+        }
+        ids[best_pos] = best_merged;
+        ids.erase(ids.begin() + static_cast<std::ptrdiff_t>(best_pos + 1));
+    }
+    return ids;
+}
+
 bool parse_u32(std::string_view text, uint32_t& out)
 {
     if (text.empty()) {
@@ -466,12 +510,17 @@ struct Tokenizer::Impl {
 
         merge_lookup_.clear();
         merge_lookup_.reserve(merges_.size());
+        base_pair_lookup_.fill(MergeStep{});
         for (size_t rank = 0; rank < merges_.size(); ++rank) {
             const auto& merge = merges_[rank];
-            merge_lookup_[TokenPair{merge.left, merge.right}] = MergeStep{
+            const MergeStep step{
                 static_cast<uint32_t>(rank),
                 merge.merged,
             };
+            merge_lookup_[TokenPair{merge.left, merge.right}] = step;
+            if (merge.left < 256 && merge.right < 256) {
+                base_pair_lookup_[(merge.left << 8) | merge.right] = step;
+            }
         }
 
         token_trie_.clear();
@@ -484,16 +533,38 @@ struct Tokenizer::Impl {
             token_trie_.insert(std::string_view(key_bytes), id);
         }
         token_trie_.finalize();
+
+        safe_token_trie_.clear();
+        if (encode_mode_ == EncodeMode::PairRules) {
+            approx_nodes = 1;
+            for (const auto& [_, bytes] : vocab_) {
+                approx_nodes += bytes.size();
+            }
+            safe_token_trie_.reserve(approx_nodes);
+            for (const auto& [id, bytes] : vocab_) {
+                std::string key(bytes.begin(), bytes.end());
+                // Native vocab entries are only safe as whole-piece shortcuts if
+                // the learned pair rules would produce exactly that token.
+                auto encoded = encode_pair_rules_for_cache(
+                    key, byte_lookup_, base_pair_lookup_, merge_lookup_);
+                if (encoded.size() == 1 && encoded[0] == id) {
+                    safe_token_trie_.insert(std::string_view(key), id);
+                }
+            }
+        }
+        safe_token_trie_.finalize();
     }
 
     std::unordered_map<uint32_t, std::vector<uint8_t>> vocab_;
     RanksMap token_to_id_;
     TokenTrie token_trie_;
+    TokenTrie safe_token_trie_;
     std::unordered_map<TokenPair, MergeStep, TokenPairHash> merge_lookup_;
     std::vector<MergeRule> merges_;
     std::unordered_map<std::string, uint32_t> special_tokens_;
     EncodeMode encode_mode_ = EncodeMode::PairRules;
     std::array<uint32_t, 256> byte_lookup_{};
+    std::array<MergeStep, 65536> base_pair_lookup_{};
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -990,13 +1061,23 @@ void Tokenizer::train(const std::string& text,
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
 {
     const auto& byte_lookup_ = impl_->byte_lookup_;
+    const auto& base_pair_lookup_ = impl_->base_pair_lookup_;
     const auto& merge_lookup_ = impl_->merge_lookup_;
     const auto& token_trie_ = impl_->token_trie_;
+    const auto& safe_token_trie_ = impl_->safe_token_trie_;
     const auto& special_tokens_ = impl_->special_tokens_;
     const EncodeMode encode_mode = impl_->encode_mode_;
 
     std::vector<uint32_t> out;
     out.reserve(text.size());
+
+    auto get_pair_merge = [&](uint32_t left, uint32_t right) -> MergeStep {
+        if (left < 256 && right < 256) {
+            return base_pair_lookup_[(left << 8) | right];
+        }
+        auto it = merge_lookup_.find(TokenPair{left, right});
+        return it != merge_lookup_.end() ? it->second : MergeStep{};
+    };
 
     auto encode_piece = [&](std::string_view piece) {
         const size_t pn = piece.size();
@@ -1004,9 +1085,59 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
         if (pn > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
             throw std::length_error("Tokenization chunk is too large");
         }
+        if (encode_mode == EncodeMode::ByteSpanRanks) {
+            if (const uint32_t* found = token_trie_.find(piece); found != nullptr) {
+                out.push_back(*found);
+                return;
+            }
+        } else if (const uint32_t* found = safe_token_trie_.find(piece); found != nullptr) {
+            out.push_back(*found);
+            return;
+        }
         if (pn == 1 || merge_lookup_.empty()) {
             for (unsigned char byte : piece) {
                 out.push_back(byte_lookup_[byte]);
+            }
+            return;
+        }
+        if (encode_mode == EncodeMode::PairRules && pn == 2) {
+            const uint32_t left = byte_lookup_[static_cast<unsigned char>(piece[0])];
+            const uint32_t right = byte_lookup_[static_cast<unsigned char>(piece[1])];
+            const MergeStep merge = get_pair_merge(left, right);
+            if (merge.rank != UINT32_MAX) {
+                out.push_back(merge.merged);
+            } else {
+                out.push_back(left);
+                out.push_back(right);
+            }
+            return;
+        }
+        if (encode_mode == EncodeMode::PairRules && pn == 3) {
+            const uint32_t t0 = byte_lookup_[static_cast<unsigned char>(piece[0])];
+            const uint32_t t1 = byte_lookup_[static_cast<unsigned char>(piece[1])];
+            const uint32_t t2 = byte_lookup_[static_cast<unsigned char>(piece[2])];
+            const MergeStep left_merge = get_pair_merge(t0, t1);
+            const MergeStep right_merge = get_pair_merge(t1, t2);
+            if (left_merge.rank == UINT32_MAX && right_merge.rank == UINT32_MAX) {
+                out.push_back(t0);
+                out.push_back(t1);
+                out.push_back(t2);
+            } else if (left_merge.rank <= right_merge.rank) {
+                const MergeStep chained = get_pair_merge(left_merge.merged, t2);
+                if (chained.rank != UINT32_MAX) {
+                    out.push_back(chained.merged);
+                } else {
+                    out.push_back(left_merge.merged);
+                    out.push_back(t2);
+                }
+            } else {
+                const MergeStep chained = get_pair_merge(t0, right_merge.merged);
+                if (chained.rank != UINT32_MAX) {
+                    out.push_back(chained.merged);
+                } else {
+                    out.push_back(t0);
+                    out.push_back(right_merge.merged);
+                }
             }
             return;
         }
@@ -1059,11 +1190,7 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
                 }
                 return MergeStep{};
             }
-            auto it = merge_lookup_.find(TokenPair{ll[idx].token, ll[n1].token});
-            if (it == merge_lookup_.end()) {
-                return MergeStep{};
-            }
-            return it->second;
+            return get_pair_merge(ll[idx].token, ll[n1].token);
         };
 
         auto heap_less = [](const HeapEntry& a, const HeapEntry& b) {
