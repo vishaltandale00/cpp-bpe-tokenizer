@@ -706,10 +706,9 @@ static inline uint32_t next_cp(std::string_view text, size_t pos, size_t& len)
     return utf8_codepoint(&text[pos], len);
 }
 
-// Internal pretokenize returning string_views (no allocations).
-// Caller must ensure the backing string outlives the views.
-static void pretokenize_sv(std::string_view text,
-                           std::vector<std::string_view>& out)
+// Internal pretokenizer. The callback receives string_views backed by `text`.
+template <typename Emit>
+static void pretokenize_each_sv(std::string_view text, Emit& emit)
 {
     size_t i = 0;
     const size_t n = text.size();
@@ -723,13 +722,13 @@ static void pretokenize_sv(std::string_view text,
             {
                 char c = text[i + 1];
                 if (c == 's' || c == 't' || c == 'm' || c == 'd')
-                { out.emplace_back(text.substr(i, 2)); i += 2; continue; }
+                { emit(text.substr(i, 2)); i += 2; continue; }
             }
             if (i + 2 < n)
             {
                 char c1 = text[i + 1], c2 = text[i + 2];
                 if ((c1 == 'l' && c2 == 'l') || (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e'))
-                { out.emplace_back(text.substr(i, 3)); i += 3; continue; }
+                { emit(text.substr(i, 3)); i += 3; continue; }
             }
         }
 
@@ -749,7 +748,7 @@ static void pretokenize_sv(std::string_view text,
                 j += cl;
             }
             if (j > lstart)
-            { out.emplace_back(text.substr(i, j - i)); i = j; continue; }
+            { emit(text.substr(i, j - i)); i = j; continue; }
         }
 
         // Alt 3:  ?\p{N}++
@@ -769,7 +768,7 @@ static void pretokenize_sv(std::string_view text,
                 break;
             }
             if (j > dstart)
-            { out.emplace_back(text.substr(i, j - i)); i = j; continue; }
+            { emit(text.substr(i, j - i)); i = j; continue; }
         }
 
         // Alt 4:  ?[^\s\p{L}\p{N}]++
@@ -791,7 +790,7 @@ static void pretokenize_sv(std::string_view text,
                 j += cl;
             }
             if (j > ostart)
-            { out.emplace_back(text.substr(i, j - i)); i = j; continue; }
+            { emit(text.substr(i, j - i)); i = j; continue; }
         }
 
         // Alt 5: \s++$
@@ -804,7 +803,7 @@ static void pretokenize_sv(std::string_view text,
                 j += cl;
             }
             if (j > i && j == n)
-            { out.emplace_back(text.substr(i, j - i)); i = j; continue; }
+            { emit(text.substr(i, j - i)); i = j; continue; }
         }
 
         // Alt 6: \s+(?!\S)
@@ -819,24 +818,35 @@ static void pretokenize_sv(std::string_view text,
                 j += cl;
             }
             if (j > i && prev > i)
-            { out.emplace_back(text.substr(i, prev - i)); i = prev; continue; }
+            { emit(text.substr(i, prev - i)); i = prev; continue; }
         }
 
         // Alt 7: \s
         {
             size_t cl; uint32_t cp = next_cp(text, i, cl);
             if (is_unicode_space(cp))
-            { out.emplace_back(text.substr(i, cl)); i += cl; continue; }
+            { emit(text.substr(i, cl)); i += cl; continue; }
         }
 
         // Fallback
         {
             size_t cl = utf8_byte_len(static_cast<unsigned char>(text[i]));
             if (i + cl > n) cl = 1;
-            out.emplace_back(text.substr(i, cl));
+            emit(text.substr(i, cl));
             i += cl;
         }
     }
+}
+
+// Internal pretokenize returning string_views (no allocations).
+// Caller must ensure the backing string outlives the views.
+static void pretokenize_sv(std::string_view text,
+                           std::vector<std::string_view>& out)
+{
+    auto emit = [&](std::string_view piece) {
+        out.emplace_back(piece);
+    };
+    pretokenize_each_sv(text, emit);
 }
 
 std::vector<std::string> pretokenize(std::string_view text)
@@ -1079,6 +1089,8 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
         return it != merge_lookup_.end() ? it->second : MergeStep{};
     };
 
+    static constexpr size_t kScanMergeLimit = 64;
+
     auto encode_piece = [&](std::string_view piece) {
         const size_t pn = piece.size();
         if (pn == 0) return;
@@ -1138,6 +1150,79 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
                     out.push_back(t0);
                     out.push_back(right_merge.merged);
                 }
+            }
+            return;
+        }
+        if (encode_mode == EncodeMode::PairRules && pn <= kScanMergeLimit) {
+            thread_local std::vector<uint32_t> ids;
+            ids.resize(pn);
+            for (size_t i = 0; i < pn; ++i) {
+                ids[i] = byte_lookup_[static_cast<unsigned char>(piece[i])];
+            }
+
+            while (ids.size() > 1) {
+                uint32_t best_rank = UINT32_MAX;
+                uint32_t best_merged = UINT32_MAX;
+                size_t best_pos = ids.size();
+                for (size_t i = 0; i + 1 < ids.size(); ++i) {
+                    const MergeStep merge = get_pair_merge(ids[i], ids[i + 1]);
+                    if (merge.rank < best_rank) {
+                        best_rank = merge.rank;
+                        best_merged = merge.merged;
+                        best_pos = i;
+                    }
+                }
+                if (best_rank == UINT32_MAX) {
+                    break;
+                }
+                ids[best_pos] = best_merged;
+                ids.erase(ids.begin() + static_cast<std::ptrdiff_t>(best_pos + 1));
+            }
+
+            out.insert(out.end(), ids.begin(), ids.end());
+            return;
+        }
+        if (encode_mode == EncodeMode::ByteSpanRanks && pn <= kScanMergeLimit) {
+            thread_local std::vector<uint32_t> starts;
+            starts.resize(pn + 1);
+            for (size_t i = 0; i <= pn; ++i) {
+                starts[i] = static_cast<uint32_t>(i);
+            }
+
+            size_t count = pn;
+            while (count > 1) {
+                uint32_t best_rank = UINT32_MAX;
+                size_t best_pos = count;
+                for (size_t i = 0; i + 1 < count; ++i) {
+                    const size_t start = starts[i];
+                    const size_t end = starts[i + 2];
+                    const uint32_t* found = token_trie_.find(piece.substr(start, end - start));
+                    if (found != nullptr && *found < best_rank) {
+                        best_rank = *found;
+                        best_pos = i;
+                    }
+                }
+                if (best_rank == UINT32_MAX) {
+                    break;
+                }
+                for (size_t i = best_pos + 1; i < count; ++i) {
+                    starts[i] = starts[i + 1];
+                }
+                --count;
+            }
+
+            for (size_t i = 0; i < count; ++i) {
+                const size_t start = starts[i];
+                const size_t end = starts[i + 1];
+                if (end == start + 1) {
+                    out.push_back(byte_lookup_[static_cast<unsigned char>(piece[start])]);
+                    continue;
+                }
+                const uint32_t* found = token_trie_.find(piece.substr(start, end - start));
+                if (found == nullptr) {
+                    throw std::logic_error("Byte-span BPE produced unknown token span");
+                }
+                out.push_back(*found);
             }
             return;
         }
@@ -1269,13 +1354,10 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
 
     if (special_tokens_.empty())
     {
-        thread_local std::vector<std::string_view> sv_chunks;
-        sv_chunks.clear();
-        pretokenize_sv(text, sv_chunks);
-        for (const auto& piece : sv_chunks)
-        {
+        auto emit_piece = [&](std::string_view piece) {
             encode_piece(piece);
-        }
+        };
+        pretokenize_each_sv(text, emit_piece);
     }
     else
     {
