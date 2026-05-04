@@ -56,7 +56,21 @@ FetchContent_Declare(
   GIT_TAG        v3.11.3
 )
 FetchContent_MakeAvailable(json)
-target_link_libraries(bpe_tokenizer PRIVATE nlohmann_json::nlohmann_json)
+
+# utf8proc for HF-compatible NFC normalization and Unicode categories
+set(UTF8PROC_INSTALL OFF CACHE BOOL "" FORCE)
+set(UTF8PROC_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  utf8proc
+  GIT_REPOSITORY https://github.com/JuliaStrings/utf8proc.git
+  GIT_TAG        v2.11.3
+)
+FetchContent_MakeAvailable(utf8proc)
+
+target_link_libraries(bpe_tokenizer PRIVATE
+  nlohmann_json::nlohmann_json
+  utf8proc
+)
 
 # ── Tests ────────────────────────────────────────────────────────────
 if(BPE_BUILD_TESTS)

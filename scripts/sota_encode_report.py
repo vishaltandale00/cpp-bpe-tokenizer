@@ -9,16 +9,20 @@ This script is intentionally stricter than the library benchmarks:
     Rust crate and the Python binding when possible,
   - writes raw machine, corpus, parity, and timing data to JSON.
 
-The current C++ library supports GPT-2-style byte-level BPE models. Qwen3 uses
-Hugging Face tokenizer.json semantics with NFC normalization and a Qwen-specific
-regex pre-tokenizer, so this harness marks the C++ Qwen3 parity gate as
-unsupported until that model format is implemented.
+The C++ library supports its native/GPT-2-style byte-level BPE format and a
+strict subset of Hugging Face ByteLevel BPE tokenizer.json files, including the
+Qwen3 tokenizer used by the default benchmark. The benchmark normalizes corpora
+to NFC before timing because the library does not implement a general HF
+normalizer pipeline.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import math
+import os
 import platform
 import shutil
 import statistics
@@ -30,10 +34,17 @@ import unicodedata
 from pathlib import Path
 from typing import Callable
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is available on the intended Unix hosts.
+    resource = None  # type: ignore[assignment]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO_ROOT / "runs" / "sota_encode_report.json"
 DEFAULT_CACHE = REPO_ROOT / ".cache" / "sota_encode"
 TARGET_SAMPLE_BYTES = 8 * 1024 * 1024
+DEFAULT_SERVICE_THREADS = max(1, min(8, os.cpu_count() or 1))
+HF_RUST_TOKENIZERS_VERSION = "0.23.1"
 
 
 def run(cmd: list[str], cwd: Path = REPO_ROOT) -> None:
@@ -52,6 +63,9 @@ def load_corpora() -> dict[str, str]:
             "こんにちは世界 🌍 你好世界 안녕하세요 세계 "
             "مرحبا بالعالم Привет мир 🚀✨🔥 "
         ) * 20,
+        "unicode_numbers": (
+            " ①test ¼test Ⅷ apples ٢٣ things १२३ items １２３ boxes "
+        ) * 40,
         "code": (
             "template <typename It>\n"
             "uint64_t hash_bytes(It begin, It end) {\n"
@@ -63,10 +77,58 @@ def load_corpora() -> dict[str, str]:
             "    return h;\n"
             "}\n"
         ) * 64,
+        "python": (
+            "def tokenize_batch(tokenizer, rows):\n"
+            "    result = []\n"
+            "    for row in rows:\n"
+            "        if row.get('enabled'):\n"
+            "            result.append(tokenizer.encode(row['text']))\n"
+            "    return result\n\n"
+        ) * 80,
+        "javascript": (
+            "export function groupBy(items, keyFn) {\n"
+            "  const groups = new Map();\n"
+            "  for (const item of items) {\n"
+            "    const key = keyFn(item);\n"
+            "    groups.set(key, [...(groups.get(key) ?? []), item]);\n"
+            "  }\n"
+            "  return groups;\n"
+            "}\n"
+        ) * 70,
+        "jsonl_logs": (
+            '{"ts":"2026-05-04T10:15:30Z","level":"INFO","path":"/v1/chat/completions",'
+            '"request_id":"req_01HY7D4S9","latency_ms":37.42,"tokens":512}\n'
+        ) * 180,
+        "markdown": (
+            "# Tokenizer Benchmark Notes\n\n"
+            "| corpus | bytes | tokens | parity |\n"
+            "| --- | ---: | ---: | --- |\n"
+            "| unicode | 2048 | 540 | pass |\n\n"
+            "- Keep file I/O outside the timed region.\n"
+            "- Record exact hashes for each reference implementation.\n\n"
+        ) * 60,
+        "urls_base64": (
+            "GET /api/v2/search?q=tokenizer%20benchmark&cursor=eyJwYWdlIjoyLCJsaW1pdCI6NTAwfQ== "
+            "https://example.com/a/b/c?utm_source=bench&utm_campaign=sota#fragment "
+        ) * 100,
+        "emoji_zwj": (
+            "👩‍💻👨‍👩‍👧‍👦🧑🏽‍🚀🏳️‍🌈✨🔥🚀 — shipping reliable tokenizers requires boring tests. "
+        ) * 120,
+        "cjk_dense": (
+            "今天天气很好，我们一起测试分词器的性能。東京都市圏の交通データを解析します。"
+            "한국어 문장도 함께 포함해서 경계 조건을 확인합니다。"
+        ) * 80,
+        "rtl": (
+            "مرحبا بالعالم هذا اختبار لاتجاه النص. שלום עולם זהו מבחן קצר. "
+            "الأرقام ١٢٣٤٥ والرموز ؟! يجب أن تبقى صحيحة. "
+        ) * 90,
         "punct": (
             "!!! ??? ... :: == != <= >= -> <- => {[]} () <> // ## @@ ~~ || && %% $$ `` '' \"\"\n"
             "*** --- ___ +++ ::: ;;; ,,, ... ??? !!! ::: === !== >>> <<< [[ ]] {{ }}\n"
         ) * 80,
+        "blank_lines": ("\n \n2\n \n0\n\t\n") * 200,
+        "whitespace_pathological": (" \t  \n\n\r\n    \tword\t\tword\n" * 220),
+        "long_word": ("antidisestablishmentarianism" * 500) + "\n",
         "qwen_chat": (
             "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n"
             "<|im_start|>user\nExplain tokenizer parity in one paragraph.<|im_end|>\n"
@@ -82,7 +144,7 @@ def write_corpora(corpora: dict[str, str], corpus_dir: Path) -> dict[str, Path]:
     paths = {}
     for name, text in corpora.items():
         path = corpus_dir / f"{name}.txt"
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text.encode("utf-8"))
         paths[name] = path
     return paths
 
@@ -96,7 +158,35 @@ def fnv_ids(ids: list[int]) -> int:
     return h
 
 
-def median_mib_s(encode: Callable[[str], list[int]], text: str, repeats: int, target_bytes: int) -> tuple[float, int, int]:
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    pos = q * (len(ordered) - 1)
+    lo = math.floor(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def peak_rss_bytes() -> int:
+    if resource is None:
+        return 0
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    if sys.platform == "darwin":
+        return int(usage.ru_maxrss)
+    return int(usage.ru_maxrss) * 1024
+
+
+def measure_encode(
+    encode: Callable[[str], list[int]],
+    text: str,
+    repeats: int,
+    target_bytes: int,
+    threads: int = 1,
+) -> dict[str, float | int]:
+    if threads != 1:
+        raise ValueError("Python in-process baselines only support single-thread measurement")
     n_bytes = len(text.encode("utf-8"))
     batch = max(1, target_bytes // max(n_bytes, 1))
     for _ in range(min(batch, 8)):
@@ -115,8 +205,20 @@ def median_mib_s(encode: Callable[[str], list[int]], text: str, repeats: int, ta
 
     median = statistics.median(durations)
     mib_s = (n_bytes * batch / median) / (1024 * 1024)
+    per_call_seconds = [duration / batch for duration in durations]
     ids = encode(text)
-    return mib_s, token_count, fnv_ids(ids)
+    return {
+        "mib_s": mib_s,
+        "tokens": token_count,
+        "hash": fnv_ids(ids),
+        "batch": batch,
+        "repeats": repeats,
+        "threads": threads,
+        "p50_s": percentile(per_call_seconds, 0.50),
+        "p95_s": percentile(per_call_seconds, 0.95),
+        "p99_s": percentile(per_call_seconds, 0.99),
+        "peak_rss_bytes": peak_rss_bytes(),
+    }
 
 
 def bench_hf_python(model_id: str, corpora: dict[str, str], repeats: int, target_bytes: int) -> dict[str, dict[str, float | int]]:
@@ -125,8 +227,7 @@ def bench_hf_python(model_id: str, corpora: dict[str, str], repeats: int, target
     tokenizer = Tokenizer.from_pretrained(model_id)
     results = {}
     for name, text in corpora.items():
-        mib_s, tokens, token_hash = median_mib_s(lambda t: tokenizer.encode(t).ids, text, repeats, target_bytes)
-        results[name] = {"mib_s": mib_s, "tokens": tokens, "hash": token_hash}
+        results[name] = measure_encode(lambda t: tokenizer.encode(t).ids, text, repeats, target_bytes)
     return results
 
 
@@ -139,8 +240,7 @@ def bench_tiktoken_gpt2(corpora: dict[str, str], repeats: int, target_bytes: int
     encoding = tiktoken.get_encoding("gpt2")
     results = {}
     for name, text in corpora.items():
-        mib_s, tokens, token_hash = median_mib_s(encoding.encode, text, repeats, target_bytes)
-        results[name] = {"mib_s": mib_s, "tokens": tokens, "hash": token_hash}
+        results[name] = measure_encode(encoding.encode, text, repeats, target_bytes)
     return results
 
 
@@ -159,14 +259,15 @@ def ensure_hf_rust_probe(cache_dir: Path) -> Path | None:
     src_dir.mkdir(parents=True, exist_ok=True)
     (project / "Cargo.toml").write_text(
         textwrap.dedent(
-            """
+            f"""
             [package]
             name = "hf_tokenizers_probe"
             version = "0.1.0"
             edition = "2021"
 
             [dependencies]
-            tokenizers = "0.23.1"
+            libc = "0.2"
+            tokenizers = "{HF_RUST_TOKENIZERS_VERSION}"
             """
         ).strip()
         + "\n",
@@ -178,6 +279,8 @@ def ensure_hf_rust_probe(cache_dir: Path) -> Path | None:
             use std::env;
             use std::fs;
             use std::hint::black_box;
+            use std::sync::{Arc, Barrier};
+            use std::thread;
             use std::time::Instant;
             use tokenizers::Tokenizer;
 
@@ -192,25 +295,61 @@ def ensure_hf_rust_probe(cache_dir: Path) -> Path | None:
                 h
             }
 
-            fn median(mut values: Vec<f64>) -> f64 {
+            fn percentile(mut values: Vec<f64>, q: f64) -> f64 {
                 values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                values[values.len() / 2]
+                if values.is_empty() {
+                    return 0.0;
+                }
+                let pos = q * ((values.len() - 1) as f64);
+                let lo = pos.floor() as usize;
+                let hi = std::cmp::min(lo + 1, values.len() - 1);
+                let frac = pos - (lo as f64);
+                values[lo] * (1.0 - frac) + values[hi] * frac
+            }
+
+            fn peak_rss_bytes() -> u64 {
+                unsafe {
+                    let mut usage: libc::rusage = std::mem::zeroed();
+                    if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+                        return 0;
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        usage.ru_maxrss as u64
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        (usage.ru_maxrss as u64) * 1024
+                    }
+                }
+            }
+
+            fn encode_batch(tokenizer: &Tokenizer, text: &str, batch: usize) -> usize {
+                let mut local_tokens = 0usize;
+                for _ in 0..batch {
+                    let enc = tokenizer.encode(text, false).unwrap();
+                    local_tokens += enc.get_ids().len();
+                    black_box(enc.get_ids());
+                }
+                local_tokens
             }
 
             fn main() {
                 let args: Vec<String> = env::args().collect();
-                if args.len() < 5 {
-                    eprintln!("usage: hf_tokenizers_probe TOKENIZER_JSON REPEATS TARGET_BYTES CORPUS_FILE...");
+                if args.len() < 6 {
+                    eprintln!("usage: hf_tokenizers_probe TOKENIZER_JSON REPEATS TARGET_BYTES THREADS CORPUS_FILE...");
                     std::process::exit(2);
                 }
-                let tokenizer = Tokenizer::from_file(&args[1]).unwrap();
+                let tokenizer = Arc::new(Tokenizer::from_file(&args[1]).unwrap());
                 let repeats: usize = args[2].parse().unwrap();
                 let target_bytes: usize = args[3].parse().unwrap();
+                let threads: usize = std::cmp::max(1, args[4].parse().unwrap());
 
-                for path in &args[4..] {
-                    let text = fs::read_to_string(path).unwrap();
+                for path in &args[5..] {
+                    let text = Arc::new(fs::read_to_string(path).unwrap());
                     let n_bytes = text.as_bytes().len();
-                    let batch = std::cmp::max(1, target_bytes / std::cmp::max(n_bytes, 1));
+                    let service_batch_bytes = std::cmp::max(n_bytes.saturating_mul(threads), 1);
+                    let batch = std::cmp::max(1, target_bytes / service_batch_bytes);
                     for _ in 0..std::cmp::min(batch, 8) {
                         let enc = tokenizer.encode(text.as_str(), false).unwrap();
                         black_box(enc.get_ids());
@@ -220,20 +359,50 @@ def ensure_hf_rust_probe(cache_dir: Path) -> Path | None:
                     let mut token_count = 0usize;
                     for _ in 0..repeats {
                         let start = Instant::now();
-                        let mut local_tokens = 0usize;
-                        for _ in 0..batch {
-                            let enc = tokenizer.encode(text.as_str(), false).unwrap();
-                            local_tokens += enc.get_ids().len();
-                            black_box(enc.get_ids());
-                        }
+                        let local_tokens = if threads == 1 {
+                            encode_batch(&tokenizer, text.as_str(), batch)
+                        } else {
+                            let barrier = Arc::new(Barrier::new(threads));
+                            let mut handles = Vec::with_capacity(threads);
+                            for _ in 0..threads {
+                                let tokenizer = Arc::clone(&tokenizer);
+                                let text = Arc::clone(&text);
+                                let barrier = Arc::clone(&barrier);
+                                handles.push(thread::spawn(move || {
+                                    barrier.wait();
+                                    encode_batch(&tokenizer, text.as_str(), batch)
+                                }));
+                            }
+                            let mut total = 0usize;
+                            for handle in handles {
+                                total += handle.join().unwrap();
+                            }
+                            total
+                        };
                         durations.push(start.elapsed().as_secs_f64());
-                        token_count = local_tokens / batch;
+                        token_count = local_tokens / (batch * threads);
                     }
 
                     let enc = tokenizer.encode(text.as_str(), false).unwrap();
-                    let mib_s = (n_bytes as f64 * batch as f64) / median(durations) / (1024.0 * 1024.0);
+                    let calls_per_repeat = (batch * threads) as f64;
+                    let per_call: Vec<f64> = durations.iter().map(|d| d / calls_per_repeat).collect();
+                    let mib_s = (n_bytes as f64 * calls_per_repeat) /
+                        percentile(durations.clone(), 0.50) / (1024.0 * 1024.0);
                     let name = std::path::Path::new(path).file_stem().unwrap().to_str().unwrap();
-                    println!("{}\t{}\t{}\t{}", name, mib_s, token_count, hash_ids(enc.get_ids()));
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        name,
+                        mib_s,
+                        token_count,
+                        hash_ids(enc.get_ids()),
+                        batch,
+                        repeats,
+                        threads,
+                        percentile(per_call.clone(), 0.50),
+                        percentile(per_call.clone(), 0.95),
+                        percentile(per_call, 0.99),
+                        peak_rss_bytes()
+                    );
                 }
             }
             '''
@@ -250,22 +419,44 @@ def parse_probe_output(output: str) -> dict[str, dict[str, float | int]]:
     for line in output.splitlines():
         if not line.strip():
             continue
-        name, mib_s, tokens, token_hash = line.split("\t")
-        results[name] = {"mib_s": float(mib_s), "tokens": int(tokens), "hash": int(token_hash)}
+        parts = line.split("\t")
+        if len(parts) == 4:
+            name, mib_s, tokens, token_hash = parts
+            results[name] = {
+                "mib_s": float(mib_s),
+                "tokens": int(tokens),
+                "hash": int(token_hash),
+            }
+            continue
+        if len(parts) != 11:
+            raise ValueError(f"unexpected probe output line: {line}")
+        name, mib_s, tokens, token_hash, batch, repeats, threads, p50_s, p95_s, p99_s, peak_rss = parts
+        results[name] = {
+            "mib_s": float(mib_s),
+            "tokens": int(tokens),
+            "hash": int(token_hash),
+            "batch": int(batch),
+            "repeats": int(repeats),
+            "threads": int(threads),
+            "p50_s": float(p50_s),
+            "p95_s": float(p95_s),
+            "p99_s": float(p99_s),
+            "peak_rss_bytes": int(peak_rss),
+        }
     return results
 
 
 def bench_hf_rust(
+    probe: Path | None,
     tokenizer_json: Path,
     corpus_paths: dict[str, Path],
     repeats: int,
     target_bytes: int,
-    cache_dir: Path,
+    threads: int,
 ) -> dict[str, dict[str, float | int]] | None:
-    probe = ensure_hf_rust_probe(cache_dir)
     if probe is None:
         return None
-    cmd = [str(probe), str(tokenizer_json), str(repeats), str(target_bytes)]
+    cmd = [str(probe), str(tokenizer_json), str(repeats), str(target_bytes), str(threads)]
     cmd.extend(str(path) for path in corpus_paths.values())
     output = subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)
     return parse_probe_output(output)
@@ -281,28 +472,30 @@ def ensure_cpp_probe(build_dir: Path) -> Path:
     run(["cmake", "--build", str(build_dir), "--target", "bpe_tokenizer", "--parallel"])
     probe = build_dir / "cpp_encode_probe"
     json_include = build_dir / "_deps" / "json-src" / "include"
+    utf8proc_lib = build_dir / "_deps" / "utf8proc-build" / "libutf8proc.a"
     run([
         "c++", "-std=c++20", "-O3", "-DNDEBUG",
         "-I", str(REPO_ROOT / "include"),
         "-I", str(json_include),
         str(REPO_ROOT / "scripts" / "cpp_encode_probe.cpp"),
         str(build_dir / "libbpe_tokenizer.a"),
+        str(utf8proc_lib),
         "-o", str(probe),
     ])
     return probe
 
 
 def bench_cpp(
+    probe: Path,
     model_dir: Path,
     corpus_paths: dict[str, Path],
     repeats: int,
     target_bytes: int,
-    build_dir: Path,
+    threads: int,
 ) -> dict[str, dict[str, float | int]] | None:
     if not model_dir.exists():
         return None
-    probe = ensure_cpp_probe(build_dir)
-    cmd = [str(probe), str(model_dir), str(repeats), str(target_bytes)]
+    cmd = [str(probe), str(model_dir), str(repeats), str(target_bytes), str(threads)]
     cmd.extend(str(path) for path in corpus_paths.values())
     output = subprocess.check_output(cmd, cwd=REPO_ROOT, text=True)
     return parse_probe_output(output)
@@ -311,6 +504,8 @@ def bench_cpp(
 def parity_status(a: dict[str, dict[str, float | int]] | None, b: dict[str, dict[str, float | int]] | None) -> dict[str, object]:
     if a is None or b is None:
         return {"status": "missing_baseline"}
+    missing_left = sorted(set(b) - set(a))
+    missing_right = sorted(set(a) - set(b))
     mismatches = []
     for name in sorted(set(a) & set(b)):
         if a[name]["tokens"] != b[name]["tokens"] or a[name]["hash"] != b[name]["hash"]:
@@ -321,7 +516,42 @@ def parity_status(a: dict[str, dict[str, float | int]] | None, b: dict[str, dict
                 "left_hash": a[name]["hash"],
                 "right_hash": b[name]["hash"],
             })
-    return {"status": "pass" if not mismatches else "fail", "mismatches": mismatches}
+    status = "pass" if not mismatches and not missing_left and not missing_right else "fail"
+    return {
+        "status": status,
+        "mismatches": mismatches,
+        "missing_left": missing_left,
+        "missing_right": missing_right,
+    }
+
+
+def throughput_status(
+    candidate: dict[str, dict[str, float | int]] | None,
+    baselines: dict[str, dict[str, dict[str, float | int]] | None],
+) -> dict[str, object]:
+    if candidate is None:
+        return {"status": "missing_candidate"}
+    failures = []
+    missing = []
+    for baseline_name, baseline in baselines.items():
+        if baseline is None:
+            missing.append(baseline_name)
+            continue
+        for corpus, row in baseline.items():
+            if corpus not in candidate:
+                failures.append({"corpus": corpus, "baseline": baseline_name, "reason": "missing_candidate_corpus"})
+                continue
+            candidate_mib_s = candidate[corpus]["mib_s"]
+            baseline_mib_s = row["mib_s"]
+            if candidate_mib_s <= baseline_mib_s:
+                failures.append({
+                    "corpus": corpus,
+                    "baseline": baseline_name,
+                    "candidate_mib_s": candidate_mib_s,
+                    "baseline_mib_s": baseline_mib_s,
+                })
+    status = "pass" if not failures and not missing else "fail"
+    return {"status": status, "failures": failures, "missing_baselines": missing}
 
 
 def machine() -> dict[str, str]:
@@ -331,6 +561,7 @@ def machine() -> dict[str, str]:
         "machine": platform.machine(),
         "processor": platform.processor(),
         "python": platform.python_version(),
+        "cpu_count": str(os.cpu_count() or ""),
     }
     if platform.system() == "Darwin":
         try:
@@ -340,6 +571,32 @@ def machine() -> dict[str, str]:
         except Exception:
             pass
     return data
+
+
+def git_metadata() -> dict[str, object]:
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip()
+    except Exception:
+        commit = None
+    try:
+        status = subprocess.check_output(["git", "status", "--short"], cwd=REPO_ROOT, text=True)
+        dirty = bool(status.strip())
+    except Exception:
+        dirty = None
+    return {
+        "commit": commit,
+        "dirty": dirty,
+    }
+
+
+def python_package_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for package in ["tokenizers", "huggingface_hub", "tiktoken"]:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
 
 
 def main() -> int:
@@ -352,19 +609,24 @@ def main() -> int:
     parser.add_argument("--build-dir", default=str(REPO_ROOT / "build-sota"))
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--target-bytes", type=int, default=TARGET_SAMPLE_BYTES)
+    parser.add_argument("--service-threads", type=int, default=DEFAULT_SERVICE_THREADS)
     parser.add_argument("--skip-rust", action="store_true")
     parser.add_argument("--skip-cpp", action="store_true")
+    parser.add_argument("--skip-serving", action="store_true")
     args = parser.parse_args()
+    if args.service_threads < 1:
+        raise SystemExit("--service-threads must be >= 1")
 
     cache_dir = Path(args.cache_dir)
     corpus_paths = write_corpora(load_corpora(), cache_dir / "corpora")
-    corpora = {name: path.read_text(encoding="utf-8") for name, path in corpus_paths.items()}
+    corpora = {name: path.read_bytes().decode("utf-8") for name, path in corpus_paths.items()}
 
     print(f"Downloading tokenizer files for {args.qwen_model} and {args.gpt2_model}")
     qwen_json = download_tokenizer_json(args.qwen_model)
     gpt2_json = download_tokenizer_json(args.gpt2_model)
 
     results: dict[str, dict[str, dict[str, float | int]] | None] = {}
+    serving_results: dict[str, dict[str, dict[str, float | int]] | None] = {}
     print("\n[HF tokenizers Python: Qwen3]")
     results["hf_python_qwen3"] = bench_hf_python(args.qwen_model, corpora, args.repeats, args.target_bytes)
 
@@ -377,39 +639,91 @@ def main() -> int:
     if args.skip_rust:
         results["hf_rust_qwen3"] = None
         results["hf_rust_gpt2"] = None
+        hf_rust_probe = None
     else:
+        hf_rust_probe = ensure_hf_rust_probe(cache_dir)
         print("\n[HF tokenizers Rust: Qwen3]")
-        results["hf_rust_qwen3"] = bench_hf_rust(qwen_json, corpus_paths, args.repeats, args.target_bytes, cache_dir)
+        results["hf_rust_qwen3"] = bench_hf_rust(hf_rust_probe, qwen_json, corpus_paths, args.repeats, args.target_bytes, 1)
         print("\n[HF tokenizers Rust: GPT-2]")
-        results["hf_rust_gpt2"] = bench_hf_rust(gpt2_json, corpus_paths, args.repeats, args.target_bytes, cache_dir)
+        results["hf_rust_gpt2"] = bench_hf_rust(hf_rust_probe, gpt2_json, corpus_paths, args.repeats, args.target_bytes, 1)
 
     if args.skip_cpp:
         results["cpp_gpt2"] = None
+        results["cpp_qwen3"] = None
+        cpp_probe = None
     else:
+        cpp_probe = ensure_cpp_probe(Path(args.build_dir))
         print("\n[C++ tokenizer: GPT-2 fixture]")
-        results["cpp_gpt2"] = bench_cpp(Path(args.cpp_gpt2_dir), corpus_paths, args.repeats, args.target_bytes, Path(args.build_dir))
+        results["cpp_gpt2"] = bench_cpp(cpp_probe, Path(args.cpp_gpt2_dir), corpus_paths, args.repeats, args.target_bytes, 1)
+        print("\n[C++ tokenizer: Qwen3 tokenizer.json]")
+        results["cpp_qwen3"] = bench_cpp(cpp_probe, qwen_json, corpus_paths, args.repeats, args.target_bytes, 1)
+
+    if args.skip_serving:
+        serving_results["cpp_gpt2"] = None
+        serving_results["cpp_qwen3"] = None
+        serving_results["hf_rust_qwen3"] = None
+        serving_results["hf_rust_gpt2"] = None
+    else:
+        if not args.skip_cpp and cpp_probe is not None:
+            print(f"\n[C++ tokenizer serving: GPT-2 fixture, {args.service_threads} threads]")
+            serving_results["cpp_gpt2"] = bench_cpp(
+                cpp_probe, Path(args.cpp_gpt2_dir), corpus_paths, args.repeats, args.target_bytes, args.service_threads)
+            print(f"\n[C++ tokenizer serving: Qwen3 tokenizer.json, {args.service_threads} threads]")
+            serving_results["cpp_qwen3"] = bench_cpp(
+                cpp_probe, qwen_json, corpus_paths, args.repeats, args.target_bytes, args.service_threads)
+        else:
+            serving_results["cpp_gpt2"] = None
+            serving_results["cpp_qwen3"] = None
+        if not args.skip_rust and hf_rust_probe is not None:
+            print(f"\n[HF tokenizers Rust serving: Qwen3, {args.service_threads} threads]")
+            serving_results["hf_rust_qwen3"] = bench_hf_rust(
+                hf_rust_probe, qwen_json, corpus_paths, args.repeats, args.target_bytes, args.service_threads)
+            print(f"\n[HF tokenizers Rust serving: GPT-2, {args.service_threads} threads]")
+            serving_results["hf_rust_gpt2"] = bench_hf_rust(
+                hf_rust_probe, gpt2_json, corpus_paths, args.repeats, args.target_bytes, args.service_threads)
+        else:
+            serving_results["hf_rust_qwen3"] = None
+            serving_results["hf_rust_gpt2"] = None
 
     parity = {
         "qwen3_hf_rust_vs_python": parity_status(results.get("hf_rust_qwen3"), results.get("hf_python_qwen3")),
         "gpt2_hf_rust_vs_python": parity_status(results.get("hf_rust_gpt2"), results.get("hf_python_gpt2")),
         "gpt2_cpp_vs_hf_python": parity_status(results.get("cpp_gpt2"), results.get("hf_python_gpt2")),
         "gpt2_cpp_vs_tiktoken": parity_status(results.get("cpp_gpt2"), results.get("tiktoken_gpt2")),
-        "qwen3_cpp_vs_hf": {
-            "status": "unsupported",
-            "reason": (
-                "The C++ library currently loads native/GPT-2-style vocab+merges. "
-                "Qwen3 needs tokenizer.json support, NFC normalization, ByteLevel vocabulary decoding, "
-                "and the Qwen regex pre-tokenizer before an apples-to-apples C++ Qwen3 SOTA claim is possible."
-            ),
-        },
+        "qwen3_cpp_vs_hf_python": parity_status(results.get("cpp_qwen3"), results.get("hf_python_qwen3")),
+        "qwen3_cpp_vs_hf_rust": parity_status(results.get("cpp_qwen3"), results.get("hf_rust_qwen3")),
     }
+    throughput = {
+        "qwen3_cpp_vs_hf": throughput_status(results.get("cpp_qwen3"), {
+            "hf_python_qwen3": results.get("hf_python_qwen3"),
+            "hf_rust_qwen3": results.get("hf_rust_qwen3"),
+        }),
+        "gpt2_cpp_vs_hf_tiktoken": throughput_status(results.get("cpp_gpt2"), {
+            "hf_python_gpt2": results.get("hf_python_gpt2"),
+            "hf_rust_gpt2": results.get("hf_rust_gpt2"),
+            "tiktoken_gpt2": results.get("tiktoken_gpt2"),
+        }),
+    }
+    all_required_parity_passed = all(row["status"] == "pass" for row in parity.values())
+    all_required_throughput_passed = all(row["status"] == "pass" for row in throughput.values())
+    sota_claim_status = (
+        "met_for_recorded_encode_only_nfc_harness"
+        if all_required_parity_passed and all_required_throughput_passed
+        else "not_met_until_required_parity_and_throughput_gates_pass"
+    )
 
     payload = {
         "scope": {
             "claim": "encode-only tokenizer throughput",
             "qwen_model": args.qwen_model,
             "full_parity_required": True,
-            "sota_claim_status": "not_met_until_qwen3_cpp_parity_and_native_baselines_pass",
+            "throughput_leadership_required": True,
+            "sota_claim_status": sota_claim_status,
+            "normalization_scope": "input corpora are NFC-normalized by this harness; the C++ Qwen path also applies NFC during encode",
+            "benchmark_modes": [
+                "single-thread encode throughput and per-call latency percentiles",
+                "shared-tokenizer multi-thread serving throughput for native C++ and HF Rust probes",
+            ],
         },
         "methodology_gates": {
             "1_define_category": "encode-only",
@@ -417,14 +731,44 @@ def main() -> int:
             "3_real_baselines": "HF tokenizers Qwen3 and GPT-2, Python binding plus Rust crate when cargo is available, plus tiktoken GPT-2 when installed",
             "4_neutral_harness": "same NFC-normalized corpus files, warmup, repeated median throughput",
             "5_serious_corpora": sorted(corpora),
-            "6_metrics": "MiB/s, token count, token-id hash, machine metadata",
+            "6_metrics": "MiB/s, token count, token-id hash, p50/p95/p99 per-call latency, peak RSS, batch size, threads, machine metadata",
             "7_control_hardware": "machine metadata recorded; caller should run on pinned/quiet host for publishable numbers",
-            "8_publish_artifacts": "this script, C++ probe source, and JSON output are reproducible artifacts",
-            "9_adversarial_review": "parity failures and unsupported Qwen3 C++ gate are explicit in JSON",
+            "8_publish_artifacts": "this script, generated Rust probe, C++ probe source, command metadata, git metadata, and JSON output are reproducible artifacts",
+            "9_adversarial_review": "parity failures, missing baselines, and normalization scope are explicit in JSON",
+            "10_throughput_gate": "C++ throughput must beat each recorded baseline on every corpus",
+            "11_serving_measurement": f"shared tokenizer measured with {args.service_threads} request threads unless --skip-serving is used",
+        },
+        "measurement_notes": {
+            "latency_percentiles": "p50/p95/p99 are per encode call, estimated from repeated fixed-size batches; increase --repeats for publishable tail estimates",
+            "memory": "peak_rss_bytes is process peak RSS reported by the measured process; Python baselines run in this script process, native probes report their own process RSS",
+            "serving": "serving_results use one loaded shared tokenizer and concurrent encode calls; file I/O and model load are outside the timed region",
+            "corpus_io": "corpus files are written and read as UTF-8 bytes to avoid platform newline translation",
+        },
+        "implementation_scope": {
+            "cpp_hf_tokenizer_json": "strict ByteLevel BPE subset with Qwen-style pre-tokenization and literal added-token matching",
+            "unsupported_hf_features": [
+                "byte_fallback",
+                "ignore_merges",
+                "added-token single_word/lstrip/rstrip/normalized flags",
+                "HF pre-tokenizer graphs other than the supported Qwen Split+ByteLevel sequence",
+                "general HF normalizer/post-processor pipelines",
+            ],
         },
         "machine": machine(),
+        "reproducibility": {
+            "script": str(Path(__file__).resolve().relative_to(REPO_ROOT)),
+            "argv": sys.argv,
+            "git": git_metadata(),
+            "cache_dir": str(cache_dir),
+            "build_dir": str(Path(args.build_dir)),
+            "target_bytes": args.target_bytes,
+            "repeats": args.repeats,
+            "service_threads": args.service_threads,
+        },
         "versions": {
             "python_executable": sys.executable,
+            "python_packages": python_package_versions(),
+            "hf_rust_tokenizers_crate": HF_RUST_TOKENIZERS_VERSION,
             "qwen_tokenizer_json": str(qwen_json),
             "gpt2_tokenizer_json": str(gpt2_json),
         },
@@ -437,7 +781,9 @@ def main() -> int:
             for name, text in corpora.items()
         },
         "results": results,
+        "serving_results": serving_results,
         "parity": parity,
+        "throughput": throughput,
     }
 
     out = Path(args.out)
@@ -451,10 +797,24 @@ def main() -> int:
             continue
         print(name)
         for corpus, row in table.items():
-            print(f"  {corpus:10s} {row['mib_s']:9.2f} MiB/s tokens={row['tokens']} hash={row['hash']}")
+            p95_us = float(row.get("p95_s", 0.0)) * 1_000_000.0
+            print(
+                f"  {corpus:22s} {row['mib_s']:9.2f} MiB/s "
+                f"tokens={row['tokens']} p95={p95_us:.2f}us hash={row['hash']}"
+            )
     print("parity")
     for name, row in parity.items():
         print(f"  {name}: {row['status']}")
+    print("throughput")
+    for name, row in throughput.items():
+        print(f"  {name}: {row['status']}")
+    print("serving")
+    for name, table in serving_results.items():
+        if not table:
+            print(f"  {name}: skipped")
+            continue
+        fastest = max(table.items(), key=lambda item: item[1]["mib_s"])
+        print(f"  {name}: {fastest[0]} {fastest[1]['mib_s']:.2f} MiB/s threads={fastest[1]['threads']}")
 
     return 0
 

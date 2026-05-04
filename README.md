@@ -9,6 +9,8 @@ The project includes:
 - BPE training primitives and training loop
 - special-token handling
 - save/load support for the native format and generated GPT-2 fixtures
+- strict Hugging Face ByteLevel BPE `tokenizer.json` loading for the Qwen3
+  encode-only parity path used by the SOTA harness
 - GoogleTest correctness tests and Google Benchmark performance tests
 
 This is an experimental library, but the current tree builds and passes the
@@ -21,8 +23,8 @@ when those fixtures have been generated.
 - C++20 compiler
 - Python 3, only for fixture generation and Python comparison scripts
 
-CMake fetches C++ test and benchmark dependencies when those targets are
-enabled.
+CMake fetches nlohmann/json and utf8proc for the core library, plus C++ test
+and benchmark dependencies when those targets are enabled.
 
 ## Build
 
@@ -97,7 +99,35 @@ auto ids = loaded.encode("hello world");
 ```
 
 `Tokenizer::load()` also supports the hex-encoded GPT-2 fixture files produced
-by `scripts/gen_fixtures.py`.
+by `scripts/gen_fixtures.py`. It can also load supported Hugging Face
+ByteLevel BPE `tokenizer.json` files, including the tokenizer used by
+`Qwen/Qwen3-0.6B`:
+
+```cpp
+auto qwen = bpe::Tokenizer::load("tokenizer.json");
+auto ids = qwen.encode("<|im_start|>user\nhello<|im_end|>\n");
+```
+
+Unsupported Hugging Face features fail during load instead of being silently
+approximated. The supported HF path validates the Qwen NFC normalizer and
+Split+ByteLevel pre-tokenizer sequence, applies NFC during encode, and is not a
+complete implementation of arbitrary HF tokenizer pipelines.
+
+## SOTA Harness
+
+The encode-only proof harness compares this library against Hugging Face
+`tokenizers`, the HF Python bindings, and `tiktoken` where applicable:
+
+```bash
+python3 -m pip install tokenizers==0.23.1 huggingface_hub==1.10.0 tiktoken==0.12.0
+python3 scripts/sota_encode_report.py
+```
+
+It writes `runs/sota_encode_report.json` with corpus hashes, token-count/hash
+parity, throughput gates, p50/p95/p99 latency, peak RSS, single-thread results,
+shared-tokenizer multi-thread serving results, machine metadata, git metadata,
+and the normalization scope. See `docs/SOTA_PROOF.md` for the claim gates,
+publishable-run command, and caveats.
 
 ## Repository Layout
 

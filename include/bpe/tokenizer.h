@@ -68,6 +68,7 @@ public:
 
 private:
     struct Impl;
+    static Tokenizer load_hf_tokenizer_json(const std::filesystem::path& path);
     std::unique_ptr<Impl> impl_;
 };
 

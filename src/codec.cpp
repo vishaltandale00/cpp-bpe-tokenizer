@@ -7,8 +7,10 @@
 #include "bpe/utils.h"
 
 #include <nlohmann/json.hpp>
+#include <utf8proc.h>
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -60,6 +62,11 @@ struct MergeStep {
 enum class EncodeMode {
     PairRules,
     ByteSpanRanks,
+};
+
+enum class PretokenizerMode {
+    Gpt2,
+    Qwen,
 };
 
 std::vector<uint32_t> encode_pair_rules_for_cache(
@@ -260,6 +267,18 @@ uint32_t json_u32(const nlohmann::json& value, const std::filesystem::path& path
     return static_cast<uint32_t>(parsed);
 }
 
+const nlohmann::json& required_json_field(
+    const nlohmann::json& obj,
+    const char* key,
+    const std::filesystem::path& path,
+    const std::string& context)
+{
+    if (!obj.is_object() || !obj.contains(key)) {
+        throw load_error(path, context + " is missing required field '" + key + "'");
+    }
+    return obj.find(key).value();
+}
+
 std::vector<std::string_view> split_ws(std::string_view line)
 {
     std::vector<std::string_view> parts;
@@ -383,6 +402,27 @@ public:
     const uint32_t* find(std::string_view key) const {
         const uint32_t node = find_node(key);
         return node != kInvalid && nodes_[node].value != kInvalid ? &nodes_[node].value : nullptr;
+    }
+
+    std::pair<uint32_t, size_t> find_longest_prefix(std::string_view text) const {
+        if (text.empty() || nodes_.empty()) {
+            return {kInvalid, 0};
+        }
+
+        uint32_t node = 0;
+        uint32_t best_value = kInvalid;
+        size_t best_len = 0;
+        for (size_t pos = 0; pos < text.size(); ++pos) {
+            node = find_child(node, static_cast<uint8_t>(text[pos]));
+            if (node == kInvalid) {
+                break;
+            }
+            if (nodes_[node].value != kInvalid) {
+                best_value = nodes_[node].value;
+                best_len = pos + 1;
+            }
+        }
+        return {best_value, best_len};
     }
 
 private:
@@ -534,6 +574,19 @@ struct Tokenizer::Impl {
         }
         token_trie_.finalize();
 
+        special_trie_.clear();
+        if (!special_tokens_.empty()) {
+            approx_nodes = 1;
+            for (const auto& [key, _] : special_tokens_) {
+                approx_nodes += key.size();
+            }
+            special_trie_.reserve(approx_nodes);
+            for (const auto& [key, id] : special_tokens_) {
+                special_trie_.insert(std::string_view(key), id);
+            }
+        }
+        special_trie_.finalize();
+
         safe_token_trie_.clear();
         if (encode_mode_ == EncodeMode::PairRules) {
             approx_nodes = 1;
@@ -543,8 +596,8 @@ struct Tokenizer::Impl {
             safe_token_trie_.reserve(approx_nodes);
             for (const auto& [id, bytes] : vocab_) {
                 std::string key(bytes.begin(), bytes.end());
-                // Native vocab entries are only safe as whole-piece shortcuts if
-                // the learned pair rules would produce exactly that token.
+                // A vocab span is only safe as a whole-piece shortcut when the
+                // learned pair rules would actually produce that token.
                 auto encoded = encode_pair_rules_for_cache(
                     key, byte_lookup_, base_pair_lookup_, merge_lookup_);
                 if (encoded.size() == 1 && encoded[0] == id) {
@@ -559,10 +612,13 @@ struct Tokenizer::Impl {
     RanksMap token_to_id_;
     TokenTrie token_trie_;
     TokenTrie safe_token_trie_;
+    TokenTrie special_trie_;
     std::unordered_map<TokenPair, MergeStep, TokenPairHash> merge_lookup_;
     std::vector<MergeRule> merges_;
     std::unordered_map<std::string, uint32_t> special_tokens_;
     EncodeMode encode_mode_ = EncodeMode::PairRules;
+    PretokenizerMode pretokenizer_mode_ = PretokenizerMode::Gpt2;
+    bool normalize_nfc_ = false;
     std::array<uint32_t, 256> byte_lookup_{};
     std::array<MergeStep, 65536> base_pair_lookup_{};
 };
@@ -649,33 +705,34 @@ static inline uint32_t utf8_codepoint(const char* s, size_t len)
     return ((u(s[0]) & 0x07) << 18) | ((u(s[1]) & 0x3F) << 12) | ((u(s[2]) & 0x3F) << 6) | (u(s[3]) & 0x3F);
 }
 
-// Approximate Unicode \p{L} (letters)
 static bool is_unicode_letter(uint32_t cp)
 {
     if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return true;
     if (cp < 0x80) return false;
-    // Latin-1 Supplement letters
-    if ((cp >= 0xC0 && cp <= 0xD6) || (cp >= 0xD8 && cp <= 0xF6) || (cp >= 0xF8 && cp <= 0xFF)) return true;
-    if (cp < 0x100) return false;
-    // Latin Extended A/B, IPA, Spacing Modifiers
-    if (cp <= 0x02FF) return true;
-    // Combining Diacritical Marks
-    if (cp >= 0x0300 && cp <= 0x036F) return true;
-    // Greek, Cyrillic, Armenian, Hebrew, Arabic, etc.
-    if (cp >= 0x0370 && cp <= 0x1FFF) return true;
-    // CJK
-    if (cp >= 0x3040 && cp <= 0x9FFF) return true;
-    if (cp >= 0xAC00 && cp <= 0xD7AF) return true; // Hangul
-    if (cp >= 0xF900 && cp <= 0xFAFF) return true;
-    // General: non-space non-digit non-punctuation above BMP
-    if (cp >= 0x10000) return true;
-    return false;
+    switch (utf8proc_category(static_cast<utf8proc_int32_t>(cp))) {
+    case UTF8PROC_CATEGORY_LU:
+    case UTF8PROC_CATEGORY_LL:
+    case UTF8PROC_CATEGORY_LT:
+    case UTF8PROC_CATEGORY_LM:
+    case UTF8PROC_CATEGORY_LO:
+        return true;
+    default:
+        return false;
+    }
 }
 
-// Approximate Unicode \p{N} (numbers)
 static bool is_unicode_digit(uint32_t cp)
 {
-    return (cp >= '0' && cp <= '9');
+    if (cp >= '0' && cp <= '9') return true;
+    if (cp < 0x80) return false;
+    switch (utf8proc_category(static_cast<utf8proc_int32_t>(cp))) {
+    case UTF8PROC_CATEGORY_ND:
+    case UTF8PROC_CATEGORY_NL:
+    case UTF8PROC_CATEGORY_NO:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // Unicode \s (whitespace)
@@ -697,6 +754,20 @@ static inline bool is_ascii_digit(unsigned char c) {
 static inline bool is_ascii_space(unsigned char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
+static inline bool is_crlf(uint32_t cp) {
+    return cp == '\r' || cp == '\n';
+}
+static inline char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+static bool is_qwen_letter(uint32_t cp)
+{
+    return is_unicode_letter(cp);
+}
+static bool is_qwen_digit(uint32_t cp)
+{
+    return is_unicode_digit(cp);
+}
 
 // Advance one UTF-8 character, return its codepoint and byte length.
 static inline uint32_t next_cp(std::string_view text, size_t pos, size_t& len)
@@ -706,9 +777,39 @@ static inline uint32_t next_cp(std::string_view text, size_t pos, size_t& len)
     return utf8_codepoint(&text[pos], len);
 }
 
+static std::string normalize_nfc(std::string_view text)
+{
+    utf8proc_uint8_t* normalized = nullptr;
+    const auto len = utf8proc_map(
+        reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
+        static_cast<utf8proc_ssize_t>(text.size()),
+        &normalized,
+        static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+    if (len < 0) {
+        throw std::runtime_error(std::string("Failed to normalize input to NFC: ") +
+                                 utf8proc_errmsg(len));
+    }
+    std::string out;
+    if (len > 0) {
+        out.assign(reinterpret_cast<char*>(normalized), static_cast<size_t>(len));
+    }
+    std::free(normalized);
+    return out;
+}
+
+static bool has_non_ascii(std::string_view text)
+{
+    for (unsigned char byte : text) {
+        if (byte >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Internal pretokenizer. The callback receives string_views backed by `text`.
 template <typename Emit>
-static void pretokenize_each_sv(std::string_view text, Emit& emit)
+static void pretokenize_gpt2_each_sv(std::string_view text, Emit& emit)
 {
     size_t i = 0;
     const size_t n = text.size();
@@ -838,6 +939,160 @@ static void pretokenize_each_sv(std::string_view text, Emit& emit)
     }
 }
 
+template <typename Emit>
+static void pretokenize_qwen_each_sv(std::string_view text, Emit& emit)
+{
+    size_t i = 0;
+    const size_t n = text.size();
+
+    while (i < n)
+    {
+        // Alt 1: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (text[i] == '\'')
+        {
+            if (i + 1 < n)
+            {
+                char c = ascii_lower(text[i + 1]);
+                if (c == 's' || c == 't' || c == 'm' || c == 'd')
+                { emit(text.substr(i, 2)); i += 2; continue; }
+            }
+            if (i + 2 < n)
+            {
+                char c1 = ascii_lower(text[i + 1]);
+                char c2 = ascii_lower(text[i + 2]);
+                if ((c1 == 'l' && c2 == 'l') || (c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e'))
+                { emit(text.substr(i, 3)); i += 3; continue; }
+            }
+        }
+
+        // Alt 2: [^\r\n\p{L}\p{N}]?\p{L}+
+        {
+            size_t j = i;
+            size_t cl = 0;
+            uint32_t cp = next_cp(text, j, cl);
+            if (!is_crlf(cp) && !is_qwen_letter(cp) && !is_qwen_digit(cp)) {
+                j += cl;
+            }
+            const size_t lstart = j;
+            while (j < n) {
+                size_t lcl = 0;
+                uint32_t lcp = next_cp(text, j, lcl);
+                if (!is_qwen_letter(lcp)) break;
+                j += lcl;
+            }
+            if (j > lstart)
+            { emit(text.substr(i, j - i)); i = j; continue; }
+        }
+
+        // Alt 3: \p{N}
+        {
+            size_t cl = 0;
+            uint32_t cp = next_cp(text, i, cl);
+            if (is_qwen_digit(cp))
+            { emit(text.substr(i, cl)); i += cl; continue; }
+        }
+
+        // Alt 4:  ?[^\s\p{L}\p{N}]+[\r\n]*
+        {
+            size_t j = i;
+            if (j < n && text[j] == ' ') j++;
+            const size_t ostart = j;
+            while (j < n)
+            {
+                size_t cl = 0;
+                uint32_t cp = next_cp(text, j, cl);
+                if (is_unicode_space(cp) || is_qwen_letter(cp) || is_qwen_digit(cp)) break;
+                j += cl;
+            }
+            if (j > ostart)
+            {
+                while (j < n)
+                {
+                    size_t cl = 0;
+                    uint32_t cp = next_cp(text, j, cl);
+                    if (!is_crlf(cp)) break;
+                    j += cl;
+                }
+                emit(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+
+        // Alt 5: \s*[\r\n]+
+        {
+            size_t j = i;
+            size_t last_crlf_end = i;
+            while (j < n)
+            {
+                size_t cl = 0;
+                uint32_t cp = next_cp(text, j, cl);
+                if (!is_unicode_space(cp)) break;
+                j += cl;
+                if (is_crlf(cp)) {
+                    last_crlf_end = j;
+                }
+            }
+            if (last_crlf_end > i)
+            {
+                emit(text.substr(i, last_crlf_end - i));
+                i = last_crlf_end;
+                continue;
+            }
+        }
+
+        // Alt 6: \s+(?!\S)
+        {
+            size_t j = i;
+            size_t prev = i;
+            while (j < n)
+            {
+                size_t cl = 0;
+                uint32_t cp = next_cp(text, j, cl);
+                if (!is_unicode_space(cp)) break;
+                prev = j;
+                j += cl;
+            }
+            if (j > i && (j == n || prev > i))
+            {
+                const size_t end = (j == n) ? j : prev;
+                emit(text.substr(i, end - i));
+                i = end;
+                continue;
+            }
+        }
+
+        // Alt 7: \s+
+        {
+            size_t j = i;
+            while (j < n)
+            {
+                size_t cl = 0;
+                uint32_t cp = next_cp(text, j, cl);
+                if (!is_unicode_space(cp)) break;
+                j += cl;
+            }
+            if (j > i)
+            { emit(text.substr(i, j - i)); i = j; continue; }
+        }
+
+        size_t cl = utf8_byte_len(static_cast<unsigned char>(text[i]));
+        if (i + cl > n) cl = 1;
+        emit(text.substr(i, cl));
+        i += cl;
+    }
+}
+
+template <typename Emit>
+static void pretokenize_each_sv(std::string_view text, Emit& emit, PretokenizerMode mode = PretokenizerMode::Gpt2)
+{
+    if (mode == PretokenizerMode::Qwen) {
+        pretokenize_qwen_each_sv(text, emit);
+    } else {
+        pretokenize_gpt2_each_sv(text, emit);
+    }
+}
+
 // Internal pretokenize returning string_views (no allocations).
 // Caller must ensure the backing string outlives the views.
 static void pretokenize_sv(std::string_view text,
@@ -860,9 +1115,10 @@ std::vector<std::string> pretokenize(std::string_view text)
     return out;
 }
 
-std::vector<PreToken> pretokenize_with_specials(
+static std::vector<PreToken> pretokenize_with_specials_mode(
     std::string_view text,
-    const std::vector<std::string>& special_tokens)
+    const std::vector<std::string>& special_tokens,
+    PretokenizerMode mode)
 {
     std::vector<std::string> specs = special_tokens;
     for (const auto& tok : specs) {
@@ -893,18 +1149,35 @@ std::vector<PreToken> pretokenize_with_specials(
 
         if (!best_tok)
         {
-            for (auto& t : pretokenize(text.substr(pos))) out.push_back({t, false});
+            std::vector<std::string_view> svs;
+            auto emit = [&](std::string_view piece) {
+                svs.emplace_back(piece);
+            };
+            pretokenize_each_sv(text.substr(pos), emit, mode);
+            for (auto sv : svs) out.push_back({std::string(sv), false});
             break;
         }
 
         if (best_pos > pos)
         {
-            for (auto& t : pretokenize(text.substr(pos, best_pos - pos))) out.push_back({t, false});
+            std::vector<std::string_view> svs;
+            auto emit = [&](std::string_view piece) {
+                svs.emplace_back(piece);
+            };
+            pretokenize_each_sv(text.substr(pos, best_pos - pos), emit, mode);
+            for (auto sv : svs) out.push_back({std::string(sv), false});
         }
         out.push_back({*best_tok, true});
         pos = best_pos + best_tok->size();
     }
     return out;
+}
+
+std::vector<PreToken> pretokenize_with_specials(
+    std::string_view text,
+    const std::vector<std::string>& special_tokens)
+{
+    return pretokenize_with_specials_mode(text, special_tokens, PretokenizerMode::Gpt2);
 }
 
 // ---- trainer.h: BPE training primitives ----------------------------
@@ -1065,6 +1338,8 @@ void Tokenizer::train(const std::string& text,
     impl_->special_tokens_ = std::move(trained_special_tokens);
     impl_->token_to_id_ = std::move(token_to_id);
     impl_->encode_mode_ = EncodeMode::PairRules;
+    impl_->pretokenizer_mode_ = PretokenizerMode::Gpt2;
+    impl_->normalize_nfc_ = false;
     impl_->rebuild_encode_caches();
 }
 
@@ -1075,11 +1350,21 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
     const auto& merge_lookup_ = impl_->merge_lookup_;
     const auto& token_trie_ = impl_->token_trie_;
     const auto& safe_token_trie_ = impl_->safe_token_trie_;
+    const auto& special_trie_ = impl_->special_trie_;
     const auto& special_tokens_ = impl_->special_tokens_;
     const EncodeMode encode_mode = impl_->encode_mode_;
+    const PretokenizerMode pretokenizer_mode = impl_->pretokenizer_mode_;
+    const bool normalize_nfc_input = impl_->normalize_nfc_;
+
+    std::string normalized_text;
+    std::string_view input(text);
+    if (normalize_nfc_input && has_non_ascii(text)) {
+        normalized_text = normalize_nfc(text);
+        input = normalized_text;
+    }
 
     std::vector<uint32_t> out;
-    out.reserve(text.size());
+    out.reserve(input.size());
 
     auto get_pair_merge = [&](uint32_t left, uint32_t right) -> MergeStep {
         if (left < 256 && right < 256) {
@@ -1226,7 +1511,6 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
             }
             return;
         }
-
         struct LLNode {
             uint32_t token;
             uint32_t start;
@@ -1357,25 +1641,35 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const
         auto emit_piece = [&](std::string_view piece) {
             encode_piece(piece);
         };
-        pretokenize_each_sv(text, emit_piece);
+        pretokenize_each_sv(input, emit_piece, pretokenizer_mode);
     }
     else
     {
-        std::vector<std::string> specials;
-        specials.reserve(special_tokens_.size());
-        for (const auto& [s, _] : special_tokens_) specials.push_back(s);
-        auto pretokens = pretokenize_with_specials(text, specials);
-        for (const auto& pt : pretokens)
-        {
-            if (pt.is_special)
-            {
-                auto it = special_tokens_.find(pt.text);
-                if (it != special_tokens_.end()) out.push_back(it->second);
+        const std::string_view all(input);
+        auto emit_normal = [&](std::string_view segment) {
+            auto emit_piece = [&](std::string_view piece) {
+                encode_piece(piece);
+            };
+            pretokenize_each_sv(segment, emit_piece, pretokenizer_mode);
+        };
+
+        size_t pos = 0;
+        size_t normal_start = 0;
+        while (pos < all.size()) {
+            const auto [id, len] = special_trie_.find_longest_prefix(all.substr(pos));
+            if (len > 0) {
+                if (pos > normal_start) {
+                    emit_normal(all.substr(normal_start, pos - normal_start));
+                }
+                out.push_back(id);
+                pos += len;
+                normal_start = pos;
+                continue;
             }
-            else
-            {
-                encode_piece(pt.text);
-            }
+            ++pos;
+        }
+        if (normal_start < all.size()) {
+            emit_normal(all.substr(normal_start));
         }
     }
 
@@ -1419,6 +1713,9 @@ void Tokenizer::save(const std::filesystem::path& dir) const
     const auto& merges_ = impl_->merges_;
     const auto& special_tokens_ = impl_->special_tokens_;
     const EncodeMode encode_mode = impl_->encode_mode_;
+    if (impl_->pretokenizer_mode_ != PretokenizerMode::Gpt2) {
+        throw save_error(dir, "saving HF tokenizer.json models is not supported yet");
+    }
 
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -1505,6 +1802,56 @@ static std::vector<uint8_t> parse_hex_bytes(
     return out;
 }
 
+static const std::array<int16_t, 512>& byte_level_inverse()
+{
+    static const std::array<int16_t, 512> inverse = [] {
+        std::array<int16_t, 512> out{};
+        out.fill(-1);
+        std::array<bool, 256> visible{};
+        visible.fill(false);
+
+        auto add_visible = [&](uint32_t first, uint32_t last) {
+            for (uint32_t b = first; b <= last; ++b) {
+                visible[b] = true;
+                out[b] = static_cast<int16_t>(b);
+            }
+        };
+        add_visible('!', '~');
+        add_visible(0xA1, 0xAC);
+        add_visible(0xAE, 0xFF);
+
+        uint32_t extra = 0;
+        for (uint32_t b = 0; b < 256; ++b) {
+            if (!visible[b]) {
+                out[256 + extra] = static_cast<int16_t>(b);
+                ++extra;
+            }
+        }
+        return out;
+    }();
+    return inverse;
+}
+
+static std::vector<uint8_t> decode_byte_level_token(
+    std::string_view token,
+    const std::filesystem::path& path,
+    const std::string& field)
+{
+    std::vector<uint8_t> bytes;
+    bytes.reserve(token.size());
+    const auto& inverse = byte_level_inverse();
+    for (size_t pos = 0; pos < token.size();) {
+        size_t len = 0;
+        const uint32_t cp = next_cp(token, pos, len);
+        if (cp >= inverse.size() || inverse[cp] < 0) {
+            throw load_error(path, field + " contains a character outside the HF ByteLevel alphabet");
+        }
+        bytes.push_back(static_cast<uint8_t>(inverse[cp]));
+        pos += len;
+    }
+    return bytes;
+}
+
 enum class VocabFormat {
     Gpt2Hex,
     Native
@@ -1539,8 +1886,301 @@ static VocabFormat classify_vocab_format(
     return saw_gpt2 ? VocabFormat::Gpt2Hex : VocabFormat::Native;
 }
 
+static constexpr std::string_view kQwenSplitRegex =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
+static bool json_bool_field(
+    const nlohmann::json& obj,
+    std::string_view field,
+    bool expected,
+    bool default_value)
+{
+    auto it = obj.find(std::string(field));
+    if (it == obj.end()) {
+        return default_value == expected;
+    }
+    return it->is_boolean() && it->get<bool>() == expected;
+}
+
+static bool is_bytelevel_component(
+    const nlohmann::json& obj,
+    bool add_prefix_space,
+    bool trim_offsets,
+    bool use_regex)
+{
+    return obj.is_object() &&
+           obj.value("type", "") == "ByteLevel" &&
+           json_bool_field(obj, "add_prefix_space", add_prefix_space, false) &&
+           json_bool_field(obj, "trim_offsets", trim_offsets, true) &&
+           json_bool_field(obj, "use_regex", use_regex, true);
+}
+
+static void validate_qwen_hf_pipeline(
+    const nlohmann::json& j,
+    const std::filesystem::path& tokenizer_path)
+{
+    if (!j.contains("normalizer") || !j["normalizer"].is_object() ||
+        j["normalizer"].value("type", "") != "NFC")
+    {
+        throw load_error(tokenizer_path, "only tokenizer.json files with the Qwen NFC normalizer are supported");
+    }
+
+    if (!j.contains("pre_tokenizer") || !j["pre_tokenizer"].is_object()) {
+        throw load_error(tokenizer_path, "tokenizer.json is missing a supported Qwen pre_tokenizer");
+    }
+    const auto& pre = j["pre_tokenizer"];
+    if (pre.value("type", "") != "Sequence" ||
+        !pre.contains("pretokenizers") ||
+        !pre["pretokenizers"].is_array() ||
+        pre["pretokenizers"].size() != 2)
+    {
+        throw load_error(tokenizer_path, "only the Qwen Split+ByteLevel pre_tokenizer sequence is supported");
+    }
+
+    const auto& split = pre["pretokenizers"][0];
+    if (!split.is_object() ||
+        split.value("type", "") != "Split" ||
+        split.value("behavior", "") != "Isolated" ||
+        !json_bool_field(split, "invert", false, false) ||
+        !split.contains("pattern") ||
+        !split["pattern"].is_object() ||
+        !split["pattern"].contains("Regex") ||
+        !split["pattern"]["Regex"].is_string() ||
+        split["pattern"]["Regex"].get<std::string>() != kQwenSplitRegex)
+    {
+        throw load_error(tokenizer_path, "unsupported Qwen Split pre_tokenizer pattern");
+    }
+
+    if (!is_bytelevel_component(pre["pretokenizers"][1], false, false, false)) {
+        throw load_error(tokenizer_path, "unsupported Qwen ByteLevel pre_tokenizer options");
+    }
+
+    if (j.contains("decoder") && !is_bytelevel_component(j["decoder"], false, false, false)) {
+        throw load_error(tokenizer_path, "unsupported tokenizer.json decoder");
+    }
+    if (j.contains("post_processor") && !is_bytelevel_component(j["post_processor"], false, false, false)) {
+        throw load_error(tokenizer_path, "unsupported tokenizer.json post_processor");
+    }
+}
+
+Tokenizer Tokenizer::load_hf_tokenizer_json(const std::filesystem::path& tokenizer_path)
+{
+    std::ifstream f(tokenizer_path);
+    if (!f) {
+        throw load_error(tokenizer_path, "required file is missing or unreadable");
+    }
+
+    nlohmann::json j;
+    try {
+        f >> j;
+    } catch (const nlohmann::json::exception& e) {
+        throw load_error(tokenizer_path, std::string("invalid JSON: ") + e.what());
+    }
+    if (!j.is_object()) {
+        throw load_error(tokenizer_path, "tokenizer.json must be a JSON object");
+    }
+
+    try {
+    validate_qwen_hf_pipeline(j, tokenizer_path);
+
+    const auto& model = required_json_field(j, "model", tokenizer_path, "tokenizer.json");
+    if (!model.is_object() || model.value("type", "") != "BPE") {
+        throw load_error(tokenizer_path, "only HF BPE tokenizer.json models are supported");
+    }
+    if (model.value("byte_fallback", false) || model.value("ignore_merges", false)) {
+        throw load_error(tokenizer_path, "byte_fallback/ignore_merges BPE models are not supported");
+    }
+
+    Tokenizer tok;
+    auto& vocab_ = tok.impl_->vocab_;
+    auto& token_to_id_ = tok.impl_->token_to_id_;
+    auto& merges_ = tok.impl_->merges_;
+    auto& special_tokens_ = tok.impl_->special_tokens_;
+
+    const auto& vocab_json = required_json_field(model, "vocab", tokenizer_path, "model");
+    if (!vocab_json.is_object() || vocab_json.empty()) {
+        throw load_error(tokenizer_path, "model.vocab must be a non-empty object");
+    }
+
+    std::unordered_set<uint32_t> seen_ids;
+    std::unordered_set<std::string> seen_bytes;
+    std::array<bool, 256> single_bytes_seen{};
+    single_bytes_seen.fill(false);
+    for (auto it = vocab_json.begin(); it != vocab_json.end(); ++it) {
+        const uint32_t id = json_u32(it.value(), tokenizer_path, "model.vocab token id");
+        auto bytes = decode_byte_level_token(it.key(), tokenizer_path, "model.vocab token");
+        if (bytes.empty()) {
+            throw load_error(tokenizer_path, "model.vocab token must not decode to empty bytes");
+        }
+        if (bytes.size() == 1) {
+            if (id >= 256) {
+                throw load_error(tokenizer_path, "single-byte HF ByteLevel token id must be in the base token range");
+            }
+            single_bytes_seen[bytes[0]] = true;
+        } else if (id < 256) {
+            throw load_error(tokenizer_path, "base token ids 0..255 must be single-byte tokens");
+        }
+        if (!seen_ids.insert(id).second) {
+            throw load_error(tokenizer_path, "duplicate token id " + std::to_string(id));
+        }
+        std::string key(bytes.begin(), bytes.end());
+        if (!seen_bytes.insert(key).second) {
+            throw load_error(tokenizer_path, "duplicate token byte sequence");
+        }
+        vocab_[id] = std::move(bytes);
+    }
+
+    for (size_t i = 0; i < single_bytes_seen.size(); ++i) {
+        if (!single_bytes_seen[i]) {
+            throw load_error(tokenizer_path, "missing single-byte token " + std::to_string(i));
+        }
+    }
+    std::vector<bool> contiguous_ids(vocab_.size(), false);
+    for (const auto& [id, _] : vocab_) {
+        if (id >= vocab_.size()) {
+            throw load_error(tokenizer_path, "model.vocab token ids must be contiguous from 0");
+        }
+        contiguous_ids[id] = true;
+    }
+    for (size_t id = 0; id < contiguous_ids.size(); ++id) {
+        if (!contiguous_ids[id]) {
+            throw load_error(tokenizer_path, "missing model.vocab token id " + std::to_string(id));
+        }
+    }
+
+    for (const auto& [id, bytes] : vocab_) {
+        token_to_id_[std::string(bytes.begin(), bytes.end())] = id;
+    }
+
+    const auto& merges_json = required_json_field(model, "merges", tokenizer_path, "model");
+    if (!merges_json.is_array()) {
+        throw load_error(tokenizer_path, "model.merges must be an array");
+    }
+    uint32_t expected_merged_id = 256;
+    size_t merge_index = 0;
+    for (const auto& merge_json : merges_json) {
+        std::string left_token;
+        std::string right_token;
+        if (merge_json.is_array() && merge_json.size() == 2 &&
+            merge_json[0].is_string() && merge_json[1].is_string())
+        {
+            left_token = merge_json[0].get<std::string>();
+            right_token = merge_json[1].get<std::string>();
+        } else if (merge_json.is_string()) {
+            auto parts = split_ws(merge_json.get<std::string>());
+            if (parts.size() != 2) {
+                throw load_error(tokenizer_path, "model.merges entry " + std::to_string(merge_index) + " is invalid");
+            }
+            left_token = std::string(parts[0]);
+            right_token = std::string(parts[1]);
+        } else {
+            throw load_error(tokenizer_path, "model.merges entry " + std::to_string(merge_index) + " is invalid");
+        }
+
+        auto left_bytes = decode_byte_level_token(left_token, tokenizer_path, "model.merges left token");
+        auto right_bytes = decode_byte_level_token(right_token, tokenizer_path, "model.merges right token");
+        std::string left_key(left_bytes.begin(), left_bytes.end());
+        std::string right_key(right_bytes.begin(), right_bytes.end());
+        auto it_l = token_to_id_.find(left_key);
+        auto it_r = token_to_id_.find(right_key);
+        if (it_l == token_to_id_.end() || it_r == token_to_id_.end()) {
+            throw load_error(tokenizer_path, "model.merges entry " + std::to_string(merge_index) + " references unknown token");
+        }
+
+        std::vector<uint8_t> merged_bytes = std::move(left_bytes);
+        merged_bytes.insert(merged_bytes.end(), right_bytes.begin(), right_bytes.end());
+        std::string merged_key(merged_bytes.begin(), merged_bytes.end());
+        auto it_m = token_to_id_.find(merged_key);
+        if (it_m == token_to_id_.end()) {
+            throw load_error(tokenizer_path, "model.merges entry " + std::to_string(merge_index) + " merged token is missing from vocab");
+        }
+        if (it_m->second != expected_merged_id) {
+            throw load_error(tokenizer_path, "model.merges entry " + std::to_string(merge_index) + " merged id is not in priority order");
+        }
+        merges_.push_back(MergeRule{it_l->second, it_r->second, it_m->second});
+        ++expected_merged_id;
+        ++merge_index;
+    }
+
+    if (j.contains("added_tokens")) {
+        const auto& added = required_json_field(j, "added_tokens", tokenizer_path, "tokenizer.json");
+        if (!added.is_array()) {
+            throw load_error(tokenizer_path, "added_tokens must be an array");
+        }
+        std::unordered_set<uint32_t> seen_special_ids;
+        for (size_t i = 0; i < added.size(); ++i) {
+            const auto& entry = added[i];
+            if (!entry.is_object()) {
+                throw load_error(tokenizer_path, "added_tokens entry must be an object");
+            }
+            if (entry.value("single_word", false) || entry.value("lstrip", false) ||
+                entry.value("rstrip", false) || entry.value("normalized", true))
+            {
+                throw load_error(tokenizer_path, "unsupported added_tokens flags at index " + std::to_string(i));
+            }
+            if (!entry.contains("content") || !entry["content"].is_string()) {
+                throw load_error(tokenizer_path, "added_tokens entry is missing string content");
+            }
+            const uint32_t id = json_u32(
+                required_json_field(entry, "id", tokenizer_path, "added_tokens entry"),
+                tokenizer_path,
+                "added_tokens id");
+            const std::string content = required_json_field(
+                entry,
+                "content",
+                tokenizer_path,
+                "added_tokens entry").get<std::string>();
+            if (vocab_.find(id) != vocab_.end()) {
+                throw load_error(tokenizer_path, "added token id collides with model vocab");
+            }
+            if (!seen_special_ids.insert(id).second) {
+                throw load_error(tokenizer_path, "duplicate added token id " + std::to_string(id));
+            }
+            if (!special_tokens_.emplace(content, id).second) {
+                throw load_error(tokenizer_path, "duplicate added token content");
+            }
+        }
+        const uint32_t vocab_count = static_cast<uint32_t>(vocab_.size());
+        std::vector<bool> special_slots(special_tokens_.size(), false);
+        for (const auto& [_, id] : special_tokens_) {
+            if (id < vocab_count || id >= vocab_count + special_tokens_.size()) {
+                throw load_error(tokenizer_path, "added token ids must be contiguous after model vocab");
+            }
+            special_slots[id - vocab_count] = true;
+        }
+        for (size_t i = 0; i < special_slots.size(); ++i) {
+            if (!special_slots[i]) {
+                throw load_error(tokenizer_path, "missing added token id " + std::to_string(vocab_count + i));
+            }
+        }
+    }
+
+    for (const auto& [s, id] : special_tokens_) {
+        token_to_id_[s] = id;
+    }
+    tok.impl_->encode_mode_ = EncodeMode::PairRules;
+    tok.impl_->pretokenizer_mode_ = PretokenizerMode::Qwen;
+    tok.impl_->normalize_nfc_ = true;
+    tok.impl_->rebuild_encode_caches();
+    return tok;
+    } catch (const nlohmann::json::exception& e) {
+        throw load_error(tokenizer_path, std::string("invalid tokenizer.json structure: ") + e.what());
+    }
+}
+
 Tokenizer Tokenizer::load(const std::filesystem::path& dir)
 {
+    if (std::filesystem::is_regular_file(dir)) {
+        if (dir.filename() == "tokenizer.json") {
+            return load_hf_tokenizer_json(dir);
+        }
+        throw load_error(dir, "unsupported tokenizer file");
+    }
+    const auto tokenizer_json_path = dir / "tokenizer.json";
+    if (std::filesystem::exists(tokenizer_json_path)) {
+        return load_hf_tokenizer_json(tokenizer_json_path);
+    }
+
     Tokenizer tok;
     auto& vocab_ = tok.impl_->vocab_;
     auto& token_to_id_ = tok.impl_->token_to_id_;
