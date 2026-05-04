@@ -127,7 +127,8 @@ It writes `runs/sota_encode_report.json` with corpus hashes, token-count/hash
 parity, throughput gates, p50/p95/p99 latency, peak RSS, single-thread results,
 shared-tokenizer multi-thread serving results, machine metadata, git metadata,
 and the normalization scope. See `docs/SOTA_PROOF.md` for the claim gates,
-publishable-run command, and caveats.
+publishable-run command, and caveats. See `docs/BENCHMARK_RESULTS.md` for a
+sanitized publishable benchmark summary.
 
 ## Repository Layout
 
