@@ -46,43 +46,47 @@ python3 scripts/sota_encode_report.py \
 | Qwen3 C++ throughput beats HF baselines on every corpus | pass |
 | GPT-2 C++ throughput beats HF/tiktoken baselines on every corpus | pass |
 
-## Single-Thread Throughput
+## Headline Results
 
-Ranges are min to max MiB/s across the 19 recorded corpora.
+The benchmark is corpus-sensitive, so the primary public result is
+corpus-by-corpus speedup, not a single absolute MiB/s number. C++ was faster
+than the recorded baseline on every corpus in the report.
 
-| Implementation | Range |
-| --- | ---: |
-| C++ GPT-2 | 7.83-261.05 MiB/s |
-| C++ Qwen3 | 8.57-174.59 MiB/s |
-| tiktoken GPT-2 | 0.42-36.98 MiB/s |
-| HF Rust GPT-2 | 2.94-14.13 MiB/s |
-| HF Rust Qwen3 | 4.84-16.19 MiB/s |
-| HF Python GPT-2 | 3.41-9.88 MiB/s |
-| HF Python Qwen3 | 3.93-9.77 MiB/s |
+| Comparison | Geomean Speedup | Median Speedup | Worst Case | Best Case |
+| --- | ---: | ---: | ---: | ---: |
+| C++ Qwen3 vs HF Rust Qwen3 | 10.32x | 16.21x | 1.39x | 24.04x |
+| C++ Qwen3 vs HF Python Qwen3 | 13.34x | 20.90x | 1.59x | 30.07x |
+| C++ GPT-2 vs tiktoken GPT-2 | 6.07x | 6.75x | 1.26x | 18.80x |
+| C++ GPT-2 vs HF Rust GPT-2 | 14.80x | 19.21x | 1.20x | 39.34x |
 
-## Speedups
+## Absolute Throughput
 
-Ranges are corpus-by-corpus speedups from the same report.
+Absolute MiB/s varies widely because BPE encode cost depends on token shape,
+merge depth, Unicode handling, and pre-tokenized span length. The slowest case
+in this run was the intentionally pathological `long_word` corpus; normal
+structured/prose/code corpora are much higher. For the C++ encoders:
 
-| Comparison | Range |
-| --- | ---: |
-| C++ Qwen3 vs HF Rust Qwen3 | 1.39x-24.04x |
-| C++ Qwen3 vs HF Python Qwen3 | 1.59x-30.07x |
-| C++ GPT-2 vs tiktoken GPT-2 | 1.26x-18.80x |
-| C++ GPT-2 vs HF Rust GPT-2 | 1.20x-39.34x |
+| Implementation | Slowest Corpus | Median Corpus | Fastest Corpus |
+| --- | ---: | ---: | ---: |
+| C++ GPT-2 | 7.83 MiB/s | 101.40 MiB/s | 261.05 MiB/s |
+| C++ Qwen3 | 8.57 MiB/s | 104.29 MiB/s | 174.59 MiB/s |
+
+The raw JSON contains every per-corpus MiB/s value for the C++ implementation
+and each baseline.
 
 ## Shared-Tokenizer Serving
 
 The serving measurement uses one loaded shared tokenizer with 8 concurrent
 request threads. File I/O and model loading are outside the timed region.
-Ranges are min to max MiB/s across the 19 corpora.
 
-| Implementation | Range |
-| --- | ---: |
-| C++ GPT-2 | 57.91-1981.62 MiB/s |
-| C++ Qwen3 | 64.05-1305.38 MiB/s |
-| HF Rust GPT-2 | 16.81-68.61 MiB/s |
-| HF Rust Qwen3 | 20.82-70.82 MiB/s |
+| Comparison | Geomean Speedup | Median Speedup | Worst Case | Best Case |
+| --- | ---: | ---: | ---: | ---: |
+| C++ Qwen3 vs HF Rust Qwen3 | 17.47x | 28.73x | 1.86x | 39.98x |
+| C++ GPT-2 vs HF Rust GPT-2 | 23.37x | 34.15x | 1.34x | 73.51x |
+
+For absolute serving throughput, the C++ encoders measured 57.91-1981.62 MiB/s
+for GPT-2 and 64.05-1305.38 MiB/s for Qwen3, with median corpus throughput of
+788.04 MiB/s and 787.35 MiB/s respectively.
 
 ## Corpora
 
